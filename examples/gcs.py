@@ -19,7 +19,7 @@ class GCS(tk.Tk):
         # Connection string input
         tk.Label(self, text="Connection string:").pack(pady=(10, 0))
         self.conn_entry = tk.Entry(self, width=35)
-        self.conn_entry.insert(0, "udp:127.0.0.1:5760")
+        self.conn_entry.insert(0, "tcp:127.0.0.1:5762")
         self.conn_entry.pack(pady=5)
 
         # Connect button
@@ -53,7 +53,7 @@ class GCS(tk.Tk):
 
     def _connect(self, conn_str):
         try:
-            self.vehicle = connect(conn_str, wait_ready=True, timeout=60, heartbeat_timeout=30)
+            self.vehicle = connect(conn_str, wait_ready=False, heartbeat_timeout=30)
             self.after(0, lambda: self.status.config(text="Status: connected", fg="green"))
         except Exception as e:
             msg = str(e)  # save the message now, before 'e' disappears
