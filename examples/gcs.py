@@ -2,12 +2,20 @@ import collections
 import collections.abc
 collections.MutableMapping = collections.abc.MutableMapping  # fix for Python 3.10+
 
+import math
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
 
 from dronekit import connect, VehicleMode
+
+try:
+    import tkintermapview
+    from PIL import Image, ImageDraw, ImageTk
+    MAP_AVAILABLE = True
+except ImportError:
+    MAP_AVAILABLE = False
 
 MODES = ["GUIDED", "STABILIZE", "LOITER", "LAND", "RTL"]
 
@@ -17,6 +25,9 @@ DEFLECT = 300          # how far roll/pitch/yaw move from the middle while a key
 THROTTLE_STEP = 20     # throttle change per tick while W/S is held
 TICK_MS = 100          # 10 Hz: RC override is re-sent and the GUI is refreshed
 STICK_SIZE = 130       # size of the stick squares in pixels
+MAP_EVERY_N_TICKS = 3  # the map is refreshed every 3rd tick (about 3 times a second)
+TRAIL_MIN_STEP_M = 1.0 # a new trail point is added after the drone moves this far
+TRAIL_MAX_POINTS = 1000
 
 # Keys that control the drone. Letters are compared in lowercase.
 CONTROL_KEYS = {"w", "a", "s", "d", "x", "Left", "Right", "Up", "Down"}
@@ -37,13 +48,25 @@ class GCS(tk.Tk):
         self.pressed = set()
         self.release_jobs = {}
 
+        # Map state
+        self.map_widget = None
+        self.drone_marker = None
+        self.trail = []
+        self.trail_path = None
+        self.icon_cache = {}
+        self.last_icon_key = None
+        self.map_ticks = 0
+
         left = tk.Frame(self)
         left.grid(row=0, column=0, padx=10, pady=10, sticky="n")
         right = tk.Frame(self)
         right.grid(row=0, column=1, padx=10, pady=10, sticky="n")
+        map_frame = tk.Frame(self)
+        map_frame.grid(row=0, column=2, padx=10, pady=10, sticky="n")
 
         self._build_left(left)
         self._build_right(right)
+        self._build_map(map_frame)
 
         self.bind_all("<KeyPress>", self.on_key_press)
         self.bind_all("<KeyRelease>", self.on_key_release)
@@ -97,6 +120,8 @@ class GCS(tk.Tk):
         self.armed_label.pack(fill="x")
         self.alt_label = tk.Label(status, text="Altitude: -", anchor="w")
         self.alt_label.pack(fill="x")
+        self.heading_label = tk.Label(status, text="Yaw: -", anchor="w")
+        self.heading_label.pack(fill="x")
 
         # RC visualization (like Mission Planner)
         rc = tk.LabelFrame(parent, text="RC channels (sent values)", padx=10, pady=5)
@@ -171,6 +196,7 @@ class GCS(tk.Tk):
                 pass
             self.vehicle = None
         self.info_var.set("")
+        self._reset_map()
 
     def on_close(self):
         self.close_connection()
@@ -238,7 +264,12 @@ class GCS(tk.Tk):
                 self.rc_var.set(False)
                 messagebox.showwarning("Not connected", "Connect to the vehicle first.")
                 return
-            self.throttle = RC_MIN
+            try:
+                alt = self.vehicle.location.global_relative_frame.alt
+            except Exception:
+                alt = None
+            # Already flying (for example after Takeoff): start at 1500 = hold altitude
+            self.throttle = RC_MID if (alt or 0) > 1 else RC_MIN
             self.focus_set()  # take the focus away from the entry fields
         else:
             self.pressed.clear()
@@ -274,10 +305,112 @@ class GCS(tk.Tk):
         self.release_jobs.pop(key, None)
         self.pressed.discard(key)
 
+    # ------------------------------------------------------------------ map
+    def _build_map(self, parent):
+        box = tk.LabelFrame(parent, text="Map", padx=5, pady=5)
+        box.pack()
+        if not MAP_AVAILABLE:
+            tk.Label(box, fg="red", justify="left",
+                     text="Map is not available.\nInstall it with:\n  pip install tkintermapview"
+                     ).pack(padx=20, pady=20)
+            return
+        self.map_widget = tkintermapview.TkinterMapView(box, width=480, height=430, corner_radius=0)
+        self.map_widget.pack()
+        self.map_widget.set_position(0, 0)
+        self.map_widget.set_zoom(2)
+
+        controls = tk.Frame(box)
+        controls.pack(fill="x", pady=(5, 0))
+        self.follow_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(controls, text="Follow drone", variable=self.follow_var).pack(side="left")
+        tk.Button(controls, text="Clear trail", command=self._clear_trail).pack(side="right")
+
+    def _arrow_icon(self, yaw_deg):
+        """Arrow pointing in the yaw direction (0 = North, clockwise). Cached every 5 degrees."""
+        key = int(round(yaw_deg / 5.0)) % 72
+        icon = self.icon_cache.get(key)
+        if icon is None:
+            big = 96
+            img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.polygon([(48, 6), (78, 84), (48, 66), (18, 84)],
+                         fill=(230, 60, 40, 255), outline=(255, 255, 255, 255))
+            img = img.rotate(-key * 5, resample=Image.BICUBIC)  # PIL rotates counterclockwise
+            img = img.resize((44, 44), Image.LANCZOS)
+            icon = ImageTk.PhotoImage(img)
+            self.icon_cache[key] = icon  # keep a reference, otherwise Tk drops the image
+        return key, icon
+
+    def _update_map(self):
+        if self.map_widget is None or self.vehicle is None:
+            return
+        try:
+            loc = self.vehicle.location.global_relative_frame
+            lat, lon = loc.lat, loc.lon
+            yaw = self.vehicle.attitude.yaw
+        except Exception:
+            return
+        # No GPS position yet
+        if lat is None or lon is None or (abs(lat) < 1e-6 and abs(lon) < 1e-6):
+            return
+
+        yaw_deg = math.degrees(yaw) % 360 if yaw is not None else 0.0
+        key, icon = self._arrow_icon(yaw_deg)
+
+        if self.drone_marker is None:
+            self.drone_marker = self.map_widget.set_marker(lat, lon, icon=icon, icon_anchor="center")
+            self.last_icon_key = key
+            self.map_widget.set_position(lat, lon)
+            self.map_widget.set_zoom(18)
+        else:
+            self.drone_marker.set_position(lat, lon)
+            if key != self.last_icon_key:
+                self.drone_marker.change_icon(icon)
+                self.last_icon_key = key
+            if self.follow_var.get():
+                self.map_widget.set_position(lat, lon)
+
+        self._update_trail(lat, lon)
+
+    def _update_trail(self, lat, lon):
+        if self.trail:
+            last_lat, last_lon = self.trail[-1]
+            dy = (lat - last_lat) * 110540.0
+            dx = (lon - last_lon) * 111320.0 * math.cos(math.radians(lat))
+            if math.hypot(dx, dy) < TRAIL_MIN_STEP_M:
+                return
+        self.trail.append((lat, lon))
+        if len(self.trail) > TRAIL_MAX_POINTS:
+            self.trail.pop(0)
+        if len(self.trail) >= 2:
+            if self.trail_path is None:
+                self.trail_path = self.map_widget.set_path(list(self.trail), color="#3E69CB", width=3)
+            else:
+                self.trail_path.set_position_list(list(self.trail))
+
+    def _clear_trail(self):
+        self.trail = []
+        if self.trail_path is not None:
+            self.trail_path.delete()
+            self.trail_path = None
+
+    def _reset_map(self):
+        """Called when the connection is closed."""
+        if self.map_widget is None:
+            return
+        if self.drone_marker is not None:
+            self.drone_marker.delete()
+            self.drone_marker = None
+        self.last_icon_key = None
+        self._clear_trail()
+
     # ------------------------------------------------------------ main loop
     def _tick(self):
         self._update_rc()
         self._update_status()
+        self.map_ticks += 1
+        if self.map_ticks % MAP_EVERY_N_TICKS == 0:
+            self._update_map()
         self.after(TICK_MS, self._tick)
 
     def _update_rc(self):
@@ -288,10 +421,19 @@ class GCS(tk.Tk):
             # Stick forward = lower PWM, so Up arrow lowers the pitch value
             self.pitch = RC_MID + (DEFLECT if "Down" in p else 0) - (DEFLECT if "Up" in p else 0)
             self.yaw = RC_MID + (DEFLECT if "d" in p else 0) - (DEFLECT if "a" in p else 0)
-            if "w" in p:
-                self.throttle = min(RC_MAX, self.throttle + THROTTLE_STEP)
-            if "s" in p:
-                self.throttle = max(RC_MIN, self.throttle - THROTTLE_STEP)
+            try:
+                mode = self.vehicle.mode.name
+            except Exception:
+                mode = None
+            if mode in ("STABILIZE", "ACRO"):
+                # Throttle is motor power: it stays where you leave it
+                if "w" in p:
+                    self.throttle = min(RC_MAX, self.throttle + THROTTLE_STEP)
+                if "s" in p:
+                    self.throttle = max(RC_MIN, self.throttle - THROTTLE_STEP)
+            else:
+                # LOITER / ALT_HOLD / POSHOLD: throttle is climb rate, 1500 = hold altitude
+                self.throttle = RC_MID + (DEFLECT if "w" in p else 0) - (DEFLECT if "s" in p else 0)
             if "x" in p:
                 self.throttle = RC_MIN
             try:
@@ -334,6 +476,7 @@ class GCS(tk.Tk):
             self.mode_label.config(text="Mode: -")
             self.armed_label.config(text="Armed: -")
             self.alt_label.config(text="Altitude: -")
+            self.heading_label.config(text="Yaw: -")
             return
         try:
             hb = v.last_heartbeat
@@ -350,6 +493,9 @@ class GCS(tk.Tk):
 
             alt = v.location.global_relative_frame.alt
             self.alt_label.config(text="Altitude: " + ("-" if alt is None else f"{alt:.1f} m"))
+
+            yaw = v.attitude.yaw
+            self.heading_label.config(text="Yaw: " + ("-" if yaw is None else f"{math.degrees(yaw) % 360:.0f}\u00b0"))
         except Exception:
             pass
 
